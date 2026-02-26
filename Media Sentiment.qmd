@@ -1,0 +1,277 @@
+---
+title: "Boston Celtics Media Sentiment vs. Team Performance"
+author: "Jack Murphy"
+format:
+  html:
+    toc: true
+    toc-location: left
+    self-contained: true
+jupyter: python3
+---
+
+## Project Overview
+
+I wanted to dive in to how media sentiment differs throughout an NFL regular season. With the NFL being a league that plays 17 regular season games, I am interested to investigate how sentiment varies after wins and losses, how sentiment relates to margin of victory, and the impact win streaks has on media sentiment. The NFL has been known to be an "overreaction" league and I believe that is best shown by the media. 
+
+To look at media sentiment, I will scrape game recap articles from the 2025-26 season about the Buffalo Bills from ESPN. The import part of these articles will be the title, the body of text, and the date so I can also follow the result of the game. I will compute the sentiment of each recap and merge this with data on the game results which will be win/loss, margin of victory, and if the team is on a win/losing streak. With the Buffalo Bills having a star player in Josh Allen and high expectations I expect their results to be interesting.
+
+## Setup
+
+```{python}
+import re
+import time
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import requests
+from bs4 import BeautifulSoup
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+analyzer = SentimentIntensityAnalyzer()
+```
+
+## Data Scraping
+
+# Getting Bills Game IDs
+
+```{python}
+team_id = 2
+
+api_url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team_id}/schedule"
+
+agents = {"User-Agent": "Mozilla/5.0"}
+
+response = requests.get(api_url, headers=agents)
+data = response.json()
+data = data.get("events", [])
+
+rows = []
+
+for gid in data:
+    game_id = gid.get("id")
+    date = gid.get("date")
+    matchup = gid.get("name")
+
+    rows.append({
+      "game_id": game_id,
+      "date": date,
+      "matchup": matchup,
+      "recap_url": (f"https://www.espn.com/nfl/recap/_/gameId/{game_id}")
+    })
+
+df_games = pd.DataFrame(rows)
+```
+In this code, I saw in the json that the Buffalo Bills team ID was 2 so I assigned that to them. I also created a web agent so I could scrape smoothly. I then ran a for loop using elements in the json dictionary to get game id, game date, and who the Bills were playing. Finally, I assigned this into a dataframe with those elements and used the standard structure ESPN uses to add recap urls which would help for the next step of scraping. 
+
+# Game Recaps
+```{python}
+def get_recap(url: str):
+  r = requests.get(url, headers=agents)
+
+  soup = BeautifulSoup(r.text, "html.parser")
+
+    
+  title_tag = soup.select_one('h1[class*="Story__Headline"]')
+  title = title_tag.get_text(strip=True) if title_tag else None
+
+  body_div = soup.select_one('div[class*="Story__Body"]')
+  if body_div:
+    paragraphs = body_div.find_all("p")
+    article_text = " ".join(p.get_text(" ", strip=True) for p in paragraphs)
+    article_text = re.sub(r"\s+", " ", article_text).strip()
+  else:
+    article_text = None
+
+  return {"title": title, "article_text": article_text}
+
+recap_rows = []
+
+for b, row in df_games.iterrows():
+  if not row["recap_url"]:
+    recap_rows.append({"game_id": row["game_id"], "title": None, "article_text": None})
+    continue
+
+  rec = get_recap(row["recap_url"])
+  rec["game_id"] = row["game_id"]
+  recap_rows.append(rec)
+  time.sleep(0.8)
+
+df_recaps = pd.DataFrame(recap_rows)
+
+df = df_games.merge(df_recaps, on="game_id", how="left")
+```
+For this code, I created a function which took the url and ran BeautifulSoup. From there, it would extract the title and body of the game recap. I noticed when investigating the elements of the page that each of the elements I was looking for looked like the "div" in the select one statement. Next, I ran a for loop using iterrows to get both the game recap article title from the recap link and being ran through the function. I put a if not in the for loop because I was running into an error with some game recaps not existing, which will be cleaned in later code. 
+
+# Game Scores
+
+```{python}
+
+def get_bills_score(season: int, seasontype: int = 2, weeks=range(1, 19)):
+  
+  url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+
+  rows = []
+  
+  for week in weeks:
+    pars = {"dates": season, "seasontype": seasontype, "week": week}
+    r = requests.get(url, headers=agents, params=pars)
+    events = r.json().get("events", [])
+
+    for ev in events:
+      comp = ev["competitions"][0]
+      teams = {c["team"]["displayName"]: c for c in comp["competitors"]}
+
+      if "Buffalo Bills" not in teams:
+        continue
+
+      bills = teams["Buffalo Bills"]
+
+      opp_name = [name for name in teams if name != "Buffalo Bills"][0]
+      opp = teams[opp_name]
+
+      b_score = int(bills["score"])
+      o_score = int(opp["score"])
+
+      rows.append({
+        "game_id": str(ev["id"]),
+        "week": week,
+        "opponent": opp_name,
+        "bills_score": b_score,
+        "opp_score": o_score,
+        "margin": b_score - o_score,
+        "win": 1 if b_score > o_score else 0,
+        "record": bills.get("records", [{}])[0].get("summary")
+      })
+  return pd.DataFrame(rows)
+
+df_results = get_bills_score(season=2025, seasontype=2, weeks=range(1, 19))
+df_final = df_results.merge(df, on = "game_id", how = "left")
+
+df_final
+```
+For this, I was able to find an API for ESPN for final scores. In this code, I created a function where it would get the json events. It would then for loop through the json looking for the Bills and the opponent (by finding the team who was not Buffalo in the event). It would then get the integer for both the Bills and opponent score. If the Bills score was greater than opponent it would then assign a "1" which means win in the Dataframe. Next, I got the Bills record after the completion of the game. Finally, I was able to do multiple calls in the range of weeks 1-19, merge them together to create the desired dataframe for my analysis. 
+
+# Cleaning The Dataframe
+
+```{python}
+df_final['date'] = df_final['date'].astype(str)
+
+df_final['date'] = df_final['date'].str.extract(r'^(.{10})')
+
+df_final['date'] = pd.to_datetime(df['date'])
+
+df_final = df_final.drop(16, axis = 0)
+
+df_final
+```
+Here I fixed the format of date to look better without the time. I also removed the Bills game against Jets because no game recap exists on ESPN. This is likely because it was the last game of the season and the Bills did not play key players. 
+
+## Sentiment Analysis
+
+```{python}
+df_final["title_sentiment"] = df_final["title"].apply(
+  lambda x: analyzer.polarity_scores(str(x))["compound"]
+)
+
+df_final["article_sentiment"] = df_final["article_text"].apply(
+  lambda x: analyzer.polarity_scores(str(x))["compound"]
+)
+
+df_final["article_sentiment"].describe()
+```
+I ran a Vader Sentiment Analysis here because I was looking for positive / negative sentiment from the media. I thought this would be the best one to run. 
+
+## Analysis
+
+# Comparing Wins vs. Loses
+
+```{python}
+df_final.groupby("win")["article_sentiment"].mean()
+```
+This shows the difference in sentiment scores in wins and losses. As shown it is similar with wins being slightly more positive in sentiment. 
+# Sentiment vs. Margin
+```{python}
+plt.figure(figsize=(8,6))
+
+sns.scatterplot(
+    x="margin",
+    y="article_sentiment",
+    hue="win",
+    palette={1: "green", 0: "red"},
+    data=df_final,
+    s=100
+)
+
+sns.regplot(
+    x="margin",
+    y="article_sentiment",
+    scatter=False,
+    color="black",
+    data=df_final
+)
+
+plt.title("Media Sentiment vs Margin of Victory")
+plt.xlabel("Margin of Victory")
+plt.ylabel("VADER Sentiment (Compound)")
+plt.show()
+```
+This graph shows that overall media sentiment stays pretty positive about games no matter how much the margin of victory is. Typically, sentiment stays around 1 except in a couple outlier games. Even in Bills large wins the negative sentiments were likely about the other team rather than the Bills. 
+# Sentiment Over the Season
+
+```{python}
+df_final = df_final.sort_values("date")
+
+plt.figure(figsize=(10,6))
+
+sns.lineplot(
+    x="date",
+    y="article_sentiment",
+    hue="win",
+    palette={1: "green", 0: "red"},
+    marker="o",
+    data=df_final
+)
+
+plt.title("Media Sentiment Across the Season")
+plt.xlabel("Date")
+plt.ylabel("VADER Sentiment")
+plt.xticks(rotation=45)
+plt.show()
+```
+This visualization again shows that sentiment stays pretty neutral throughout the season. I was interested in this because the Bills had a losing streak of two games which is where I thought there would be biggest margin in vader sentiment score. Overall other than a couple outliers the media did a great job in staying neutral throughout the year in their coverage of Buffalo's game recaps. 
+
+# Close Games vs. Blowouts
+
+```{python}
+df_final["game_type"] = pd.cut(
+    df_final["margin"],
+    bins=[-40, -7, 7, 40],
+    labels=["Blowout Loss", "Close Game", "Blowout Win"]
+)
+```
+
+
+```{python}
+plt.figure(figsize=(8,6))
+
+sns.boxplot(
+    x="game_type",
+    y="article_sentiment",
+    data=df_final
+)
+
+plt.title("Media Sentiment by Game Type")
+plt.xlabel("Game Type")
+plt.ylabel("VADER Sentiment")
+plt.show()
+```
+
+I wanted to see boxplots of the difference in certain game scores. If the Bills lost by more than 7, the score was between 7 points, and when the Bills won by more than 7. As shown, the Bills had more blowout wins so there was greater spread in that boxplot. The trend of being consistent stayed true here. 
+
+## Conclusion and Findings
+
+Based on the analysis, overall ESPN game recaps are positive no matter the result of the game. There were minor differences in scores based on if the Bills won or lost as wins were around .08 higher in positivity. This went against my expectations going into the project because I believed that there would be a major difference between the two scores based on previous experience of people reacting to game results. 
+
+I also believe that since the Bills made the playoffs and their record was reflective of expectations that sentiment was not as negative after losses. Losses still had a more negative sentiment which made sense, but since the Bills didn't lose games by a huge margin except for the game against the Dolphins there was not enough of a sample size to truly see. 
+
+In the future, I would be interested to run this experiment with other teams to see if there were any differences in results. Overall, the professional media was balanced but there were minor differences depending on game result which could likely be noticed when reading the actual game recaps. 
