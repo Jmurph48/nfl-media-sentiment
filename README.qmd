@@ -1,5 +1,5 @@
 ---
-title: "Boston Celtics Media Sentiment vs. Team Performance"
+title: "Buffalo Bills Media Sentiment vs. Team Performance"
 author: "Jack Murphy"
 format:
   html:
